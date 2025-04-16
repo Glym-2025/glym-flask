@@ -3,10 +3,11 @@ import os
 import boto3
 import requests
 import threading
+import time
 from PIL import Image
 import io
 import numpy as np
-from utils import validate_image, preprocess_image  # 가정: utils 모듈이 존재
+from utils import validate_image, preprocess_image
 from dotenv import load_dotenv
 import urllib.parse
 
@@ -24,8 +25,7 @@ s3_client = boto3.client(
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8080")
 
-
-# 모델 로드 (주석 처리)
+# 모델 로드
 # model = tf.keras.models.load_model("path/to/your/model")
 
 
@@ -70,7 +70,7 @@ def process_image():
         image = Image.open(io.BytesIO(image_bytes))
         image_array = np.array(image)
 
-        # 3. 이미지 검증
+        # 3. 이미지 검증 (주석 처리된 부분 유지)
         # validation_result = validate_image(image_array)
         # if not validation_result["valid"]:
         #     return (
@@ -84,29 +84,39 @@ def process_image():
         #     )
         print("Image validation passed")
 
-        # 모델 처리 부분 (주석 처리)
+        # 모델 처리 부분 (주석 처리 유지)
         # processed_image = preprocess_image(image_array)
         # features = model.predict(processed_image)
         # font_data = create_font_from_features(features)
 
-        # 비동기 콜백 실행 (작업 완료 가정)
+        # 비동기 콜백 실행 (10초 대기 추가)
         def send_callback():
             try:
+                # 10초 대기
+                print(f"Waiting 10 seconds before sending callback for jobId={jobId}")
+                time.sleep(10)
+
                 # 가정: 작업 완료 후 결과 (모델 미완성이라 더미 데이터)
                 result = {
                     "jobId": jobId,
                     "status": "COMPLETED",
-                    "result": f"s3://{bucket_name}/fonts/dummy_font_{jobId}.ttf",  # 더미 S3 경로
+                    "s3FontPath": f"s3://{bucket_name}/fonts/dummy_font_{jobId}.ttf",  # 더미 S3 경로
                 }
                 response = requests.post(callbackUrl, json=result, timeout=5)
                 print(f"Callback sent to {callbackUrl}: status={response.status_code}")
             except Exception as e:
                 print(f"Callback failed: {str(e)}")
 
+        # 비동기 스레드 시작
         threading.Thread(target=send_callback).start()
 
-        # 즉시 응답 반환
-        return jsonify({"jobId": jobId, "message": "Processing started"}), 200
+        # 즉시 request acknowledgment 응답 반환
+        return (
+            jsonify(
+                {"jobId": jobId, "status": "accepetd", "message": "Processing started"}
+            ),
+            200,
+        )
 
     except Exception as e:
         print(f"Error: {str(e)}")
