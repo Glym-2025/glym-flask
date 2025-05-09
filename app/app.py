@@ -35,17 +35,6 @@ s3_client = boto3.client(
     region_name=os.environ.get("AWS_REGION"),
 )
 
-# 모델 로드
-MODEL_BASE_PATH = os.getenv("MODEL_BASE_PATH", "models")
-encoder_model_path = os.path.join(MODEL_BASE_PATH, "encoder_model.keras")
-generator_model_path = os.path.join(MODEL_BASE_PATH, "cgan_generator.keras")
-crnn_model_path = os.path.join(MODEL_BASE_PATH, "crnn_recognition_final.keras")
-print(f"eeeeeeeeee{encoder_model_path}")
-# 모델 파일 존재 여부 확인
-for model_path in [encoder_model_path, generator_model_path, crnn_model_path]:
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-    print(f"Model file exists: {model_path}")
 
 # 모델 로드
 MODEL_BASE_PATH = os.getenv("MODEL_BASE_PATH", "models")
