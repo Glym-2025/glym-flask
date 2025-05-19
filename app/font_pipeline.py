@@ -5,9 +5,93 @@ import tensorflow as tf
 from google.cloud import vision
 from PIL import Image
 import matplotlib.pyplot as plt
-from tensorflow.keras.models import load_model
-from tensorflow.keras.layers import Dense, GlobalAveragePooling1D
+from tensorflow.keras.models import load_model, Model
+from tensorflow.keras.layers import (
+    Dense,
+    GlobalAveragePooling1D,
+    Input,
+    Reshape,
+    Conv2D,
+    Conv2DTranspose,
+    UpSampling2D,
+    BatchNormalization,
+    Activation,
+    Lambda,
+)
 import cv2
+import keras
+
+keras.config.enable_unsafe_deserialization()
+
+# Define character set and dimensions
+classes = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+num_classes = len(classes)
+noise_dim = 100
+style_dim = 128
+style_dense = Dense(noise_dim, activation="tanh")
+
+
+def char_to_onehot(char):
+    """Convert a character to one-hot encoding."""
+    idx = classes.find(char)
+    if idx == -1:
+        raise ValueError(f"Unknown character: {char}")
+    onehot = np.zeros(num_classes, dtype="float32")
+    onehot[idx] = 1.0
+    return onehot
+
+
+def ada_in(x, gamma_beta):
+    """Adaptive Instance Normalization layer."""
+    C = x.shape[-1]
+    gamma, beta = tf.split(gamma_beta, 2, axis=-1)
+    gamma = tf.reshape(gamma, [-1, 1, 1, C])
+    beta = tf.reshape(beta, [-1, 1, 1, C])
+    mean, var = tf.nn.moments(x, axes=[1, 2], keepdims=True)
+    std = tf.sqrt(var + 1e-5)
+    x_norm = (x - mean) / std
+    return gamma * x_norm + beta
+
+
+def residual_upsample_adain(x, filters, style_vec):
+    """Residual block with AdaIN and upsampling."""
+    gamma_beta = Dense(filters * 2, name=f"style_dense_{filters}")(style_vec)
+    b = Conv2DTranspose(filters, 3, strides=2, padding="same", activation="relu")(x)
+    b = BatchNormalization()(b)
+    b = Conv2D(filters, 3, padding="same")(b)
+    b = BatchNormalization()(b)
+    s = UpSampling2D()(x)
+    s = Conv2D(filters, 1, padding="same")(s)
+    s = BatchNormalization()(s)
+    out = Activation("relu")(b + s)
+    out = Lambda(
+        lambda args: ada_in(args[0], args[1]),
+        name=f"adain_{filters}",
+        output_shape=lambda input_shape: input_shape[0],
+    )([out, gamma_beta])
+    return out
+
+
+def build_generator():
+    """Build the AdaIN-based generator model with named layers."""
+    gen_input = Input(shape=(noise_dim + num_classes,), name="gen_input")
+    noise = Lambda(
+        lambda x: x[:, :noise_dim], output_shape=(noise_dim,), name="noise_split"
+    )(gen_input)
+    label = Lambda(
+        lambda x: x[:, noise_dim:], output_shape=(num_classes,), name="label_split"
+    )(gen_input)
+    style_vec = Dense(style_dim, activation="relu", name="style_fc1")(label)
+    style_vec = Dense(style_dim, activation="relu", name="style_fc2")(style_vec)
+    x = Dense(8 * 8 * 256, activation="relu", name="g_fc")(noise)
+    x = BatchNormalization(name="g_bn")(x)
+    x = Reshape((8, 8, 256), name="g_rs")(x)
+    x = residual_upsample_adain(x, 128, style_vec)
+    x = residual_upsample_adain(x, 64, style_vec)
+    x = residual_upsample_adain(x, 32, style_vec)
+    x = residual_upsample_adain(x, 16, style_vec)
+    out = Conv2D(1, 3, padding="same", activation="sigmoid", name="g_out")(x)
+    return Model(gen_input, out, name="generator")
 
 
 def generate_font(
@@ -32,30 +116,7 @@ def generate_font(
     save_path = os.path.abspath(os.path.join("data", "font_images", job_id))
     os.makedirs(output_folder, exist_ok=True)
     os.makedirs(save_path, exist_ok=True)
-    print(f"save_path: {save_path}")  # 디버깅용 로그
-
-    # Define character set
-    classes = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    num_classes = len(classes)
-    noise_dim = 100
-    style_dim = 128
-    style_dense = Dense(noise_dim, activation="tanh")
-
-    def char_to_onehot(char):
-        idx = classes.find(char)
-        if idx == -1:
-            raise ValueError(f"Unknown character: {char}")
-        onehot = np.zeros(num_classes, dtype="float32")
-        onehot[idx] = 1.0
-        return onehot
-
-    def recognize_crnn(img_pil, size=(128, 128)):
-        arr = img_pil.convert("L").resize(size)
-        x = np.array(arr, dtype="float32") / 255.0
-        x = np.expand_dims(x, axis=(0, 3))
-        prob = crnn_model.predict(x, verbose=0)[0]
-        idx = np.argmax(prob)
-        return classes[idx], float(np.max(prob))
+    print(f"save_path: {save_path}")
 
     # OCR and crop images
     with io.open(input_image_path, "rb") as f:
@@ -80,31 +141,15 @@ def generate_font(
                         cropped_images.append(cropped)
                         api_texts.append(symbol.text)
 
-    # CRNN prediction and hybrid decision
-    threshold = 0.8
-    crnn_texts, confidences = [], []
-    for img in cropped_images:
-        t, c = recognize_crnn(img)
-        crnn_texts.append(t)
-        confidences.append(c)
-
-    final_texts = [
-        crt if conf >= threshold else api
-        for crt, conf, api in zip(crnn_texts, confidences, api_texts)
-    ]
-
     # Image preprocessing
     preprocessed_images = []
     for img in cropped_images:
         img_gray = img.convert("L").resize((128, 128))
         arr = np.array(img_gray)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        eq = clahe.apply(arr)
-        blur = cv2.GaussianBlur(eq, (5, 5), 0)
+        blur = cv2.GaussianBlur(arr, (5, 5), 0)
         th = cv2.adaptiveThreshold(
             blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
         )
-
         norm = th.astype("float32") / 255.0
         norm = np.expand_dims(norm, axis=-1)
         preprocessed_images.append(norm)
@@ -115,61 +160,46 @@ def generate_font(
     encoded_vectors = encoder_model.predict(preprocessed_images)
     style_vectors = np.mean(encoded_vectors, axis=(1, 2))
     style_embedding = np.mean(style_vectors, axis=0, keepdims=True)
-
-    # Generation
-    generated_images = {}
     style_mod_vec = style_dense(style_embedding)
 
+    # Generate characters
+    generated_images = {}
     for char in classes:
-        label_vec = char_to_onehot(char)
-        label_vec = np.expand_dims(label_vec, axis=0)
-        label_vec_reshaped = np.expand_dims(label_vec, axis=1)
+        # Create one-hot encoded label
+        label_vec = np.expand_dims(char_to_onehot(char), axis=0)
 
-        noise = tf.random.normal(shape=(1, 1, noise_dim))
-        dynamic_style = style_mod_vec + tf.random.normal(
-            shape=(1, 1, noise_dim), stddev=0.05
-        )
-        enhanced_noise = noise + dynamic_style
+        # Generate random noise and combine with style
+        noise = tf.random.normal([1, noise_dim])
+        final_input = tf.concat([noise + style_mod_vec, label_vec], axis=1)
 
-        gen_input_3d = tf.concat([enhanced_noise, label_vec_reshaped], axis=2)
-        gen_input = GlobalAveragePooling1D()(gen_input_3d)
-
-        gen_img = generator_model(gen_input, training=False)
+        # Generate image
+        gen_img = generator_model(final_input, training=False)
         generated_images[char] = gen_img.numpy()[0]
 
-    # Save generated character images
-    for char, img in generated_images.items():
-        binary_img = (img[:, :, 0] > 0.5).astype(np.uint8) * 255
+        # Convert to binary image
+        binary_img = (gen_img[0, ..., 0].numpy() > 0.5).astype(np.uint8) * 255
+
+        # Save PNG
         png_path = os.path.join(output_folder, f"generated_{char}.png")
         Image.fromarray(binary_img).convert("L").save(png_path)
-        if not os.path.exists(png_path):
-            print(f"Failed to save PNG: {png_path}")
 
     # Convert to PBM
-    letters = list(classes)
-    for letter in letters:
-        img = Image.open(
-            os.path.join(output_folder, f"generated_{letter}.png")
-        ).convert("L")
-        img = img.convert("1")
-        pbm_path = os.path.join(save_path, f"{letter}.pbm")
+    for char in classes:
+        img = Image.open(os.path.join(output_folder, f"generated_{char}.png")).convert(
+            "L"
+        )
+        img = img.convert("1")  # 1-bit black and white
+        pbm_path = os.path.join(save_path, f"{char}.pbm")
         img.save(pbm_path)
-        if not os.path.exists(pbm_path):
-            print(f"Failed to create PBM file: {pbm_path}")
 
     # Convert to SVG using potrace
-    for letter in letters:
-        pbm_path = os.path.join(save_path, f"{letter}.pbm")
-        svg_path = os.path.join(save_path, f"{letter}.svg")
-        if not os.path.exists(pbm_path):
-            print(f"PBM file missing: {pbm_path}")
-            continue
+    for char in classes:
+        pbm_path = os.path.join(save_path, f"{char}.pbm")
+        svg_path = os.path.join(save_path, f"{char}.svg")
         command = f'potrace "{pbm_path}" -s -o "{svg_path}"'
         result = os.system(command)
         if result != 0:
-            print(f"Potrace failed for {letter}: {command}")
-        if not os.path.exists(svg_path):
-            print(f"SVG file not created: {svg_path}")
+            print(f"Potrace failed for {char}: {command}")
 
     # Generate FontForge script
     font_name = f"MyHandwritingFont_{job_id}"
@@ -178,34 +208,37 @@ def generate_font(
 
     os.makedirs(os.path.dirname(script_path), exist_ok=True)
 
-    # 정규화된 output_font_path
+    # Convert Windows paths to Unix style
     output_font_path = output_font_path.replace("\\", "/")
-    print(f"Generating font at: {output_font_path}")  # 디버깅용 로그 추가
+    save_path = save_path.replace("\\", "/")
 
     with open(script_path, "w") as f:
         f.write("New()\n")
         f.write(f'SetFontNames("{font_name}")\n')
-        for letter in letters:
+        for letter in classes:
             unicode_val = ord(letter)
-            svg_path = os.path.join(save_path, f"{letter}.svg")
-            svg_path = svg_path.replace("\\", "/")
-            print(f"Importing SVG: {svg_path}")
-            if not os.path.exists(svg_path):
-                print(f"Warning: SVG file does not exist: {svg_path}")
-                continue
+            svg_path = os.path.join(save_path, f"{letter}.svg").replace("\\", "/")
             f.write("SelectNone()\n")
             f.write(f"Select({unicode_val})\n")
             f.write(f'Import("{svg_path}")\n')
             f.write("ScaleToEm(1000, 0)\n")
             f.write(f'SetGlyphName("{letter}")\n')
             f.write(f"SetUnicodeValue({unicode_val})\n")
+            f.write("SetWidth(600)\n")
         f.write(f'Generate("{output_font_path}")\n')
         f.write("Quit()\n")
 
-    # Generate font using FontForge with error checking
-    result = os.system(f"fontforge -script {script_path}")
+    # Generate font using FontForge
+    print(f"Generating font at: {output_font_path}")
+    print(f"Using script: {script_path}")
+
+    command = f'fontforge -script "{script_path}"'
+    print(f"Executing command: {command}")
+    result = os.system(command)
+
     if result != 0:
         print(f"FontForge failed to execute script: {script_path}")
+        print(f"Command result: {result}")
     if not os.path.exists(output_font_path):
         print(f"Font file not generated: {output_font_path}")
         return None

@@ -12,9 +12,15 @@ import urllib.parse
 from dotenv import load_dotenv
 from tensorflow import keras
 from google.cloud import vision
-from app.font_pipeline import generate_font
+from app.font_pipeline import (
+    generate_font,
+    build_generator,
+    ada_in,
+    residual_upsample_adain,
+)
 from app.utils import validate_image
 import tensorflow as tf
+from tensorflow.keras.utils import get_custom_objects
 
 # 환경 변수 로드
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", "config", ".env"))
@@ -35,11 +41,15 @@ s3_client = boto3.client(
     region_name=os.environ.get("AWS_REGION"),
 )
 
+# 커스텀 레이어 등록
+get_custom_objects().update(
+    {"ada_in": ada_in, "residual_upsample_adain": residual_upsample_adain}
+)
 
-# 모델 로드
+# 모델 경로 설정
 MODEL_BASE_PATH = os.getenv("MODEL_BASE_PATH", "models")
 encoder_model_path = os.path.join(MODEL_BASE_PATH, "encoder_model.keras")
-generator_model_path = os.path.join(MODEL_BASE_PATH, "cgan_generator.keras")
+generator_model_path = os.path.join(MODEL_BASE_PATH, "cgan_generator_adain_final.keras")
 crnn_model_path = os.path.join(MODEL_BASE_PATH, "crnn_recognition_final.keras")
 
 # 모델 파일 존재 여부 확인
@@ -50,26 +60,54 @@ for model_path in [encoder_model_path, generator_model_path, crnn_model_path]:
 
 # 모델 로드
 try:
-    encoder_model = keras.models.load_model(encoder_model_path, compile=False)
-    generator_model = keras.models.load_model(generator_model_path, compile=False)
-    crnn_model = keras.models.load_model(crnn_model_path, compile=False)
-    print("Models loaded successfully as .keras format")
-except Exception as e:
-    print(f"Failed to load models as .keras format: {str(e)}")
-    # .h5 형식으로 시도
+    # 모델 로드 시도
+    print("모델 로드 시도 중...")
+    encoder_model = keras.models.load_model(
+        encoder_model_path,
+        compile=False,
+        custom_objects={
+            "ada_in": ada_in,
+            "residual_upsample_adain": residual_upsample_adain,
+        },
+    )
+    print("Encoder 모델 로드 성공")
+
+    # Generator 모델 로드 시도
     try:
-        encoder_model_path_h5 = os.path.join(MODEL_BASE_PATH, "encoder_model.h5")
-        generator_model_path_h5 = os.path.join(MODEL_BASE_PATH, "cgan_generator.h5")
-        crnn_model_path_h5 = os.path.join(MODEL_BASE_PATH, "crnn_recognition_final.h5")
-        encoder_model = keras.models.load_model(encoder_model_path_h5, compile=False)
         generator_model = keras.models.load_model(
-            generator_model_path_h5, compile=False
+            generator_model_path,
+            compile=False,
+            custom_objects={
+                "ada_in": ada_in,
+                "residual_upsample_adain": residual_upsample_adain,
+            },
         )
-        crnn_model = keras.models.load_model(crnn_model_path_h5, compile=False)
-        print("Models loaded successfully as .h5 format")
-    except Exception as e2:
-        print(f"Failed to load models as .h5 format: {str(e2)}")
-        raise
+        print("Generator 모델 로드 성공")
+    except Exception as gen_error:
+        print(f"Generator 모델 로드 실패: {str(gen_error)}")
+        print("새로운 Generator 모델 생성 중...")
+        generator_model = build_generator()
+        try:
+            generator_model.load_weights(generator_model_path)
+            print("Generator 모델 가중치 로드 성공")
+        except Exception as weight_error:
+            print(f"가중치 로드 실패: {str(weight_error)}")
+            print("새로운 Generator 모델을 사용합니다.")
+
+    # CRNN 모델 로드
+    crnn_model = keras.models.load_model(crnn_model_path, compile=False)
+    print("CRNN 모델 로드 성공")
+
+    # 모델을 .keras 형식으로 저장
+    print("모델을 .keras 형식으로 저장 중...")
+    encoder_model.save(encoder_model_path)
+    generator_model.save(generator_model_path)
+    crnn_model.save(crnn_model_path)
+    print("모델 저장 완료")
+
+except Exception as e:
+    print(f"모델 로드 실패: {str(e)}")
+    raise
 
 # Google Cloud Vision API 설정
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.normpath(google_credentials_path)
@@ -102,6 +140,7 @@ def process_image():
         s3ImageKey = data["s3ImageKey"]
         callbackUrl = data["callbackUrl"]
         jobId = data["jobId"]
+        font_name = data["fontName"]
         user_id = data.get("user_id", "unknown")
         if not urllib.parse.urlparse(callbackUrl).scheme:
             callbackUrl = urllib.parse.urljoin(BASE_URL, callbackUrl)
@@ -145,15 +184,15 @@ def process_image():
         )
 
         # 생성된 폰트를 S3에 업로드
-        font_s3_key = f"fonts/CustomFont_{jobId}.ttf"
+        font_s3_key = f"fonts/{font_name}_{jobId}.ttf"
         s3_client.upload_file(output_font_path, bucket_name, font_s3_key)
         font_s3_path = f"s3://{bucket_name}/{font_s3_key}"
 
         # 비동기 콜백
         def send_callback():
             try:
-                print(f"Waiting 10 seconds before sending callback for jobId={jobId}")
-                time.sleep(10)
+                print(f"Waiting 30 seconds before sending callback for jobId={jobId}")
+                time.sleep(1)  # 30초 대기
                 result = {
                     "jobId": jobId,
                     "status": "COMPLETED",
