@@ -14,7 +14,7 @@ from tensorflow import keras
 from google.cloud import vision
 from app.font_pipeline import (
     generate_font,
-    build_generator,
+    build_generator_fixed,
     ada_in,
     residual_upsample_adain,
 )
@@ -41,6 +41,9 @@ s3_client = boto3.client(
     region_name=os.environ.get("AWS_REGION"),
 )
 
+# Enable unsafe deserialization
+keras.config.enable_unsafe_deserialization()
+
 # 커스텀 레이어 등록
 get_custom_objects().update(
     {"ada_in": ada_in, "residual_upsample_adain": residual_upsample_adain}
@@ -58,6 +61,9 @@ for model_path in [encoder_model_path, generator_model_path, crnn_model_path]:
         raise FileNotFoundError(f"Model file not found: {model_path}")
     print(f"Model file exists: {model_path}")
 
+# noise_dim 정의 (Lambda 레이어에서 필요)
+noise_dim = 100
+
 # 모델 로드
 try:
     # 모델 로드 시도
@@ -72,27 +78,10 @@ try:
     )
     print("Encoder 모델 로드 성공")
 
-    # Generator 모델 로드 시도
-    try:
-        generator_model = keras.models.load_model(
-            generator_model_path,
-            compile=False,
-            custom_objects={
-                "ada_in": ada_in,
-                "residual_upsample_adain": residual_upsample_adain,
-            },
-        )
-        print("Generator 모델 로드 성공")
-    except Exception as gen_error:
-        print(f"Generator 모델 로드 실패: {str(gen_error)}")
-        print("새로운 Generator 모델 생성 중...")
-        generator_model = build_generator()
-        try:
-            generator_model.load_weights(generator_model_path)
-            print("Generator 모델 가중치 로드 성공")
-        except Exception as weight_error:
-            print(f"가중치 로드 실패: {str(weight_error)}")
-            print("새로운 Generator 모델을 사용합니다.")
+    # Generator 모델 로드 시도 - 코랩 코드와 동일하게 수정
+    generator_model = build_generator_fixed()
+    generator_model.load_weights(generator_model_path)
+    print("Generator 모델 가중치 로드 성공")
 
     # CRNN 모델 로드
     crnn_model = keras.models.load_model(crnn_model_path, compile=False)
@@ -113,8 +102,11 @@ except Exception as e:
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.normpath(google_credentials_path)
 try:
     client = vision.ImageAnnotatorClient()
+    print("Google Cloud Vision client initialized successfully")
 except Exception as e:
     print(f"Failed to initialize Google Cloud Vision client: {str(e)}")
+    print(f"Credentials path: {google_credentials_path}")
+    print(f"Credentials path exists: {os.path.exists(google_credentials_path)}")
     raise
 
 # 기본 URL 설정
@@ -145,11 +137,6 @@ def process_image():
         if not urllib.parse.urlparse(callbackUrl).scheme:
             callbackUrl = urllib.parse.urljoin(BASE_URL, callbackUrl)
 
-        # 로그
-        print(
-            f"Received request: jobId={jobId}, s3ImageKey={s3ImageKey}, callbackUrl={callbackUrl}"
-        )
-
         # S3에서 이미지 다운로드
         bucket_name, key = s3ImageKey.replace("s3://", "").split("/", 1)
         response = s3_client.get_object(Bucket=bucket_name, Key=key)
@@ -176,7 +163,6 @@ def process_image():
                 ),
                 400,
             )
-        print("Image validation passed")
 
         # 폰트 생성 (font_pipeline.py 호출)
         output_font_path = generate_font(
@@ -191,29 +177,20 @@ def process_image():
         # 비동기 콜백
         def send_callback():
             try:
-                print(f"Waiting 30 seconds before sending callback for jobId={jobId}")
-                time.sleep(1)  # 30초 대기
+                time.sleep(1)
                 result = {
                     "jobId": jobId,
                     "status": "COMPLETED",
                     "s3FontPath": font_s3_path,
                 }
                 response = requests.post(callbackUrl, json=result, timeout=5)
-                print(f"Callback sent to {callbackUrl}: status={response.status_code}")
             except Exception as e:
                 print(f"Callback failed: {str(e)}")
             finally:
-                # 정리
-                shutil.rmtree(
-                    os.path.join("data", "generated_fonts", jobId), ignore_errors=True
-                )
-                shutil.rmtree(
-                    os.path.join("data", "font_images", jobId), ignore_errors=True
-                )
+                # 입력 이미지만 삭제하고 생성된 데이터는 유지
                 if os.path.exists(input_path):
                     os.remove(input_path)
-                if os.path.exists(output_font_path):
-                    os.remove(output_font_path)
+                # script 파일은 삭제
                 script_path = os.path.join("scripts", f"make_font_{jobId}.pe")
                 if os.path.exists(script_path):
                     os.remove(script_path)
